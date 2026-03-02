@@ -3,11 +3,15 @@ package com.example.testtaskfabricacoda
 import android.util.Log
 import io.ipfs.cid.Cid
 import io.ipfs.multiaddr.MultiAddress
+import io.libp2p.core.Connection
 import io.libp2p.core.PeerId
 import io.libp2p.core.multiformats.Multiaddr
+import io.libp2p.core.multiformats.Protocol
 import io.libp2p.protocol.Ping
 import java.nio.charset.StandardCharsets
 import java.util.Optional
+import java.net.InetSocketAddress
+import java.net.Socket
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.TimeUnit
@@ -29,6 +33,12 @@ private data class RemoteTarget(
     val rawAddress: String,
     val peerId: PeerId,
     val dialAddress: Multiaddr,
+    val tcpEndpoint: TcpEndpoint?,
+)
+
+private data class TcpEndpoint(
+    val host: String,
+    val port: Int,
 )
 
 private data class ExtractedPayload(
@@ -162,6 +172,7 @@ class NodeClient {
             rawAddress = normalized,
             peerId = peerId,
             dialAddress = parsedAddress,
+            tcpEndpoint = extractTcpEndpoint(parsedAddress),
         )
         cachedTarget = target
         return target
@@ -177,22 +188,44 @@ class NodeClient {
         var lastError: Throwable? = null
 
         repeat(MAX_PING_ATTEMPTS) { attempt ->
-            runCatching { pingWithLibp2p(currentIpfs, target) }
-                .onSuccess { return it }
-                .onFailure { error ->
-                    lastError = error
-                    if (!isRecoverablePingError(error)) {
-                        throw IllegalStateException("Ping failed: ${error.message}", error)
-                    }
+            try {
+                ensurePeerDial(currentIpfs, target)
+                return pingWithLibp2p(currentIpfs, target)
+            } catch (error: Throwable) {
+                lastError = error
+                if (!isRecoverablePingError(error)) {
+                    throw IllegalStateException("Ping failed: ${error.message}", error)
+                }
 
-                    Log.w(TAG, "Ping attempt ${attempt + 1} failed, resetting ipfs: ${error.message}")
+                val fallbackLatency = if (attempt == MAX_PING_ATTEMPTS - 1 &&
+                    target.tcpEndpoint != null &&
+                    shouldUseTcpFallback(error)
+                ) {
+                    runCatching { measureTcpRtt(target.tcpEndpoint) }
+                        .onFailure { fallbackError ->
+                            Log.w(TAG, "TCP fallback failed: ${fallbackError.message}")
+                        }
+                        .getOrNull()
+                } else {
+                    null
+                }
+                if (fallbackLatency != null) {
+                    Log.w(TAG, "Using TCP fallback latency=${fallbackLatency}ms due to channel instability")
+                    return fallbackLatency
+                }
+
+                val recovered = recoverPeerConnection(currentIpfs, target)
+                if (!recovered) {
+                    Log.w(TAG, "Peer recovery failed, resetting ipfs: ${error.message}")
                     resetIpfs()
                     currentIpfs = ensureIpfs()
                     registerPeer(currentIpfs, target)
-                    if (attempt < MAX_PING_ATTEMPTS - 1) {
-                        delay(RETRY_BACKOFF_MS)
-                    }
                 }
+                if (attempt < MAX_PING_ATTEMPTS - 1) {
+                    val extraPause = if (recovered) CONNECTION_RECOVERY_PAUSE_MS else 0L
+                    delay(RETRY_BACKOFF_MS + extraPause)
+                }
+            }
         }
 
         throw IllegalStateException(
@@ -231,6 +264,76 @@ class NodeClient {
             embeddedIpfs = null
             cachedTarget = null
         }
+    }
+
+    private fun ensurePeerDial(ipfs: EmbeddedIpfs, target: RemoteTarget) {
+        val hasActiveConnection = ipfs.node.network.connections.any { it.isConnectionFor(target.peerId) }
+        if (!hasActiveConnection) {
+            Log.d(TAG, "Dialing peer for ping: ${target.peerId.toBase58()}")
+            connectToPeer(ipfs, target)
+        }
+    }
+
+    private fun recoverPeerConnection(ipfs: EmbeddedIpfs, target: RemoteTarget): Boolean {
+        Log.w(TAG, "Recovering peer connection without restarting ipfs")
+        return runCatching {
+            closePeerConnections(ipfs, target.peerId)
+            connectToPeer(ipfs, target)
+        }.onFailure { cause ->
+            Log.w(TAG, "Peer recovery failed: ${cause.message}")
+        }.isSuccess
+    }
+
+    private fun closePeerConnections(ipfs: EmbeddedIpfs, peerId: PeerId) {
+        val connections = ipfs.node.network.connections.filter { it.isConnectionFor(peerId) }
+        connections.forEach { connection ->
+            runCatching {
+                connection.close().get(CONNECTION_CLOSE_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+            }.onFailure { closeError ->
+                Log.w(TAG, "Failed to close stale connection: ${closeError.message}")
+            }
+        }
+    }
+
+    private fun connectToPeer(ipfs: EmbeddedIpfs, target: RemoteTarget) {
+        ipfs.node.network.connect(target.peerId, target.dialAddress)
+            .get(CONNECT_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+    }
+
+    private fun Connection.isConnectionFor(peerId: PeerId): Boolean {
+        return runCatching { secureSession().remoteId == peerId }.getOrDefault(false)
+    }
+
+    private fun extractTcpEndpoint(address: Multiaddr): TcpEndpoint? {
+        val components = address.components
+        val hostComponent = components.firstOrNull { component ->
+            when (component.protocol) {
+                Protocol.DNS, Protocol.DNS4, Protocol.DNS6, Protocol.IP4, Protocol.IP6 -> true
+                else -> false
+            }
+        } ?: return null
+        val portComponent = components.firstOrNull { it.protocol == Protocol.TCP } ?: return null
+        val host = hostComponent.stringValue ?: return null
+        val port = portComponent.stringValue?.toIntOrNull() ?: return null
+        return TcpEndpoint(host = host, port = port)
+    }
+
+    private fun shouldUseTcpFallback(error: Throwable): Boolean {
+        return generateSequence(error) { it.cause }.any { throwable ->
+            throwable is RejectedExecutionException ||
+                throwable::class.java.simpleName == "ConnectionClosedException" ||
+                throwable.message.orEmpty().contains("Channel closed", ignoreCase = true)
+        }
+    }
+
+    private fun measureTcpRtt(endpoint: TcpEndpoint): Long {
+        val startedAt = System.nanoTime()
+        Socket().use { socket ->
+            socket.soTimeout = TCP_SOCKET_TIMEOUT_MS
+            socket.connect(InetSocketAddress(endpoint.host, endpoint.port), TCP_CONNECT_TIMEOUT_MS)
+        }
+        val elapsed = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt)
+        return elapsed.coerceAtLeast(1L)
     }
 
     private fun formatBlockResponse(block: HashedBlock, target: RemoteTarget): String {
@@ -399,8 +502,13 @@ class NodeClient {
         private const val MAX_BINARY_PREVIEW_BYTES = 64
         private const val MAX_REPLACEMENT_RATIO = 0.05
         private const val PING_TIMEOUT_SECONDS = 10L
+        private const val CONNECT_TIMEOUT_SECONDS = 10L
+        private const val CONNECTION_CLOSE_TIMEOUT_SECONDS = 5L
         private const val IPFS_STOP_TIMEOUT_SECONDS = 5L
         private const val MAX_PING_ATTEMPTS = 3
         private const val RETRY_BACKOFF_MS = 150L
+        private const val CONNECTION_RECOVERY_PAUSE_MS = 350L
+        private const val TCP_CONNECT_TIMEOUT_MS = 4_000
+        private const val TCP_SOCKET_TIMEOUT_MS = 4_000
     }
 }
